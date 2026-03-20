@@ -23,6 +23,8 @@ Usage:
 NOTE: You need access to OpenAlex bulk data on the server.
 """
 
+from __future__ import annotations
+
 import argparse
 import csv
 import gzip

@@ -6,6 +6,8 @@ Machine-specific paths live in config.py (not committed).
 Copy config.example.py → config.py and edit for your machine.
 """
 
+from __future__ import annotations
+
 import re
 from config import DATA_DIR, OPENALEX_DIR
 
