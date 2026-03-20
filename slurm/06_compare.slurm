@@ -10,8 +10,6 @@
 # Usage: sbatch slurm/06_compare.slurm
 # Requires: steps 02 + 03 done, and OpenAlex data accessible
 
-set -euo pipefail
-
 module purge
 module load anaconda3/2023.3
 conda activate llm

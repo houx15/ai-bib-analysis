@@ -9,8 +9,6 @@
 
 # Usage: sbatch slurm/02_parse_and_filter.slurm
 
-set -euo pipefail
-
 module purge
 module load anaconda3/2023.3
 conda activate llm
