@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Download DBLP XML dump + DTD.
-# Run from the repo root.  Creates data/raw/ if needed.
+# Pass RAW_DIR as first arg, or defaults to data/raw.
 set -euo pipefail
 
-RAW_DIR="data/raw"
+RAW_DIR="${1:-data/raw}"
 mkdir -p "$RAW_DIR"
 
 DBLP_BASE="https://dblp.org/xml"
