@@ -1,23 +1,15 @@
 """
 Shared configuration for DBLP analysis pipeline.
 Paths, keywords, venue lists, and country-mapping logic.
+
+Machine-specific paths live in config.py (not committed).
+Copy config.example.py → config.py and edit for your machine.
 """
 
-from pathlib import Path
-import platform
 import re
+from config import DATA_DIR, OPENALEX_DIR
 
-# ── Paths (adjust per machine) ──────────────────────────────────────────────
-# Add your machine's hostname below
-hostname = platform.node()
-
-if hostname == 'della':
-    ROOT = Path('/tigerdata/ccc/data/2018-science/dblp-analysis')
-else:
-    # default local dev
-    ROOT = Path(__file__).resolve().parent
-
-DATA_DIR       = ROOT / 'data'
+# ── Derived paths ────────────────────────────────────────────────────────────
 RAW_DIR        = DATA_DIR / 'raw'          # downloaded dblp files
 PARSED_DIR     = DATA_DIR / 'parsed'       # intermediate CSVs
 OUTPUT_DIR     = DATA_DIR / 'output'       # final counts / figures

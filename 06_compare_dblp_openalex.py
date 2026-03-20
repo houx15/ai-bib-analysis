@@ -40,7 +40,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
 
-from dblp_config import YEAR_MIN, YEAR_MAX, PARSED_DIR, OUTPUT_DIR, is_ai_title, is_ai_venue
+from dblp_config import YEAR_MIN, YEAR_MAX, PARSED_DIR, OUTPUT_DIR, OPENALEX_DIR, is_ai_title, is_ai_venue
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -75,7 +75,7 @@ def main():
                         help='Parsed DBLP CSV from step 02 (all papers, not just AI)')
     parser.add_argument('--dblp-ai-csv', default=str(PARSED_DIR / 'dblp_ai_papers.csv'),
                         help='Filtered DBLP AI papers from step 03')
-    parser.add_argument('--openalex-dir', required=True,
+    parser.add_argument('--openalex-dir', default=str(OPENALEX_DIR),
                         help='Path to OpenAlex works/ directory with .gz files')
     args = parser.parse_args()
 

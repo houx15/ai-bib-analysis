@@ -32,7 +32,7 @@ import re
 import sys
 import time
 from pathlib import Path
-from dblp_config import PARSED_DIR, YEAR_MIN, YEAR_MAX
+from dblp_config import PARSED_DIR, YEAR_MIN, YEAR_MAX, OPENALEX_DIR
 
 
 def normalize_title(title: str) -> str:
@@ -72,7 +72,8 @@ def infer_country_from_openalex(authorships: list) -> str | None:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--dblp-ai', default=str(PARSED_DIR / 'dblp_ai_papers.csv'))
-    parser.add_argument('--openalex-dir', required=True, help='Path to OpenAlex works/ directory with .gz files')
+    parser.add_argument('--openalex-dir', default=str(OPENALEX_DIR),
+                        help='Path to OpenAlex works/ directory with .gz files')
     parser.add_argument('--output', default=str(PARSED_DIR / 'dblp_ai_papers_with_country.csv'))
     args = parser.parse_args()
 

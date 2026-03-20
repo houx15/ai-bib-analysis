@@ -29,6 +29,10 @@ Run scripts in order. Steps 01–03 and 06 are the core workflow. Steps 04–05 
 # Install dependencies
 pip install lxml matplotlib numpy
 
+# Configure paths for your machine
+cp config.example.py config.py
+# Edit config.py: set DATA_DIR and OPENALEX_DIR
+
 # 1. Download DBLP
 bash 01_download_dblp.sh
 
@@ -40,16 +44,21 @@ python 03_filter_ai_papers.py
 # → Read the printed report: check keyword/venue match counts and affiliation coverage
 
 # 6. Compare against OpenAlex (takes ~30-60 min)
-python 06_compare_dblp_openalex.py \
-    --openalex-dir /tigerdata/ccc/data/2018-science/data-openalex-20250227/works
+python 06_compare_dblp_openalex.py
 # → Check data/output/coverage_report.txt and dblp_only_ai_sample.csv
 ```
 
 ## Configuration
 
-Edit `dblp_config.py` to adjust:
+### Machine-specific paths (`config.py`)
 
-- **Machine paths**: add your server hostname and set `ROOT` (line 14)
+Copy `config.example.py` to `config.py` (gitignored) and set:
+
+- **`DATA_DIR`** — where DBLP raw/parsed/output data lives
+- **`OPENALEX_DIR`** — path to the OpenAlex `works/` directory with `.gz` files
+
+### Analysis parameters (`dblp_config.py`)
+
 - **Year range**: `YEAR_MIN` / `YEAR_MAX` (default 2015–2025)
 - **AI keywords**: `AI_KEYWORDS` (substring match) and `AI_KEYWORDS_WHOLE_WORD` (exact word match for short acronyms like "AI", "LLM", "NLP")
 - **AI venues**: `AI_VENUES` — conference and journal names matched against DBLP's `<booktitle>` / `<journal>` fields
