@@ -3,9 +3,9 @@ Machine-specific paths. Copy this file to config.py and edit.
 
     cp config.example.py config.py
 
-Example for della (Princeton HPC):
+Example for adroit/della (Princeton HPC):
     DATA_DIR     = Path('/scratch/network/yh6580/ai-bib/dblp')
-    OPENALEX_DIR = Path('/tigerdata/ccc/data/2018-science/data-openalex-20250227/works')
+    OPENALEX_DIR = Path('/scratch/network/science-of-science/data/openalex-20250227/works')
 """
 
 from pathlib import Path
