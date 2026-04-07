@@ -109,9 +109,11 @@ def main():
     print(f"  DBLP DOI index:  {len(dblp_doi_to_year):,}", file=sys.stderr)
     print(f"  DBLP title index: {len(dblp_title_to_year):,}", file=sys.stderr)
 
-    # For AI papers: separate sets
+    # For AI papers: separate sets + year lookup
     dblp_ai_dois = set()
     dblp_ai_titles = set()
+    dblp_ai_doi_to_year = {}
+    dblp_ai_title_to_year = {}
     dblp_ai_by_year = defaultdict(int)
     dblp_ai_rows_by_key = {}  # dblp_key -> row (for sampling DBLP-only later)
 
@@ -124,9 +126,13 @@ def main():
                 doi_key = extract_doi_key(row.get('doi', ''))
                 if doi_key:
                     dblp_ai_dois.add(doi_key)
+                    if doi_key not in dblp_ai_doi_to_year:
+                        dblp_ai_doi_to_year[doi_key] = year
                 nt = normalize_title(row.get('title', ''))
                 if nt:
                     dblp_ai_titles.add(nt)
+                    if nt not in dblp_ai_title_to_year:
+                        dblp_ai_title_to_year[nt] = year
                 dblp_ai_rows_by_key[row.get('dblp_key', '')] = row
         print(f"  DBLP AI papers:  {sum(dblp_ai_by_year.values()):,}", file=sys.stderr)
     else:
@@ -141,12 +147,55 @@ def main():
     # Per-year counters
     oa_all_by_year = defaultdict(int)          # total OA papers
     oa_ai_by_year = defaultdict(int)           # OA AI papers (title match)
-    overlap_all_by_year = defaultdict(int)     # in both DBLP + OA (any paper)
-    overlap_ai_by_year = defaultdict(int)      # in both DBLP + OA (AI papers)
 
-    # Track which DBLP AI papers were found in OA
+    # Track which DBLP papers have been matched (to avoid double-counting)
+    # Use the match key (doi or title) as identifier
+    matched_dblp_all = set()    # set of (doi_key or norm_title) for all papers
+    matched_dblp_ai = set()     # set of (doi_key or norm_title) for AI papers
+
+    # Track which DBLP AI papers were found in OA (for sampling DBLP-only)
     dblp_ai_matched_dois = set()
     dblp_ai_matched_titles = set()
+
+    years = list(range(YEAR_MIN, YEAR_MAX + 1))
+    live_path = OUTPUT_DIR / 'coverage_live.txt'
+
+    def write_live_progress(fi_done, n_files, n_scanned, elapsed):
+        """Write a live progress file you can cat anytime during the run."""
+        # Reconstruct per-year overlap from matched sets so far
+        ov_all = defaultdict(int)
+        for kind, key in matched_dblp_all:
+            y = dblp_doi_to_year[key] if kind == 'doi' else dblp_title_to_year[key]
+            ov_all[y] += 1
+        ov_ai = defaultdict(int)
+        for kind, key in matched_dblp_ai:
+            y = dblp_ai_doi_to_year[key] if kind == 'doi' else dblp_ai_title_to_year[key]
+            ov_ai[y] += 1
+
+        lines = []
+        lines.append(f"=== LIVE PROGRESS: {fi_done}/{n_files} files | {n_scanned:,} OA papers | {elapsed:.0f}s ===")
+        lines.append(f"(numbers will increase as more files are scanned)\n")
+
+        lines.append(f"{'Year':>6} {'DBLP-AI':>9} {'OA-AI':>9} {'Both':>9} {'DBLP-only':>10} {'OA-only':>10} {'DBLP⊂OA':>8}")
+        lines.append("-" * 70)
+        for y in years:
+            d = dblp_ai_by_year[y]
+            o = oa_ai_by_year[y]
+            b = ov_ai[y]
+            lines.append(f"{y:>6} {d:>9,} {o:>9,} {b:>9,} {d-b:>10,} {o-b:>10,} "
+                          f"{100*b/max(d,1):>7.1f}%")
+        lines.append("")
+        lines.append(f"{'Year':>6} {'DBLP':>9} {'OA':>9} {'Both':>9} {'DBLP-only':>10} {'OA-only':>10} {'DBLP⊂OA':>8}")
+        lines.append("-" * 70)
+        for y in years:
+            d = dblp_all_by_year[y]
+            o = oa_all_by_year[y]
+            b = ov_all[y]
+            lines.append(f"{y:>6} {d:>9,} {o:>9,} {b:>9,} {d-b:>10,} {o-b:>10,} "
+                          f"{100*b/max(d,1):>7.1f}%")
+
+        with open(live_path, 'w') as f:
+            f.write('\n'.join(lines) + '\n')
 
     t0 = time.time()
     n_oa_total = 0
@@ -155,10 +204,11 @@ def main():
         if (fi + 1) % 20 == 0:
             elapsed = time.time() - t0
             print(f"  file {fi+1}/{len(gz_files)} | OA scanned: {n_oa_total:,} | "
-                  f"overlap(all): {sum(overlap_all_by_year.values()):,} | "
-                  f"overlap(ai): {sum(overlap_ai_by_year.values()):,} | "
+                  f"overlap(all): {len(matched_dblp_all):,} | "
+                  f"overlap(ai): {len(matched_dblp_ai):,} | "
                   f"{elapsed:.0f}s",
                   file=sys.stderr)
+            write_live_progress(fi + 1, len(gz_files), n_oa_total, elapsed)
 
         with gzip.open(gz_path, 'rt', encoding='utf-8') as gf:
             for line in gf:
@@ -181,39 +231,56 @@ def main():
                     oa_ai_by_year[pub_year] += 1
 
                 # Match against DBLP (all papers)
-                matched_year = None
                 oa_doi = work.get('doi', '') or ''
                 doi_key = extract_doi_key(oa_doi)
+                match_key = None  # the key used to identify this DBLP paper
 
                 if doi_key and doi_key in dblp_doi_to_year:
-                    matched_year = dblp_doi_to_year[doi_key]
+                    match_key = ('doi', doi_key)
                 else:
                     nt = normalize_title(oa_title)
                     if nt and nt in dblp_title_to_year:
-                        matched_year = dblp_title_to_year[nt]
+                        match_key = ('title', nt)
 
-                if matched_year is not None:
-                    overlap_all_by_year[matched_year] += 1
+                if match_key is not None and match_key not in matched_dblp_all:
+                    matched_dblp_all.add(match_key)
 
                 # Match against DBLP AI papers specifically
                 if dblp_ai_dois or dblp_ai_titles:
-                    ai_matched = False
+                    ai_match_key = None
                     if doi_key and doi_key in dblp_ai_dois:
-                        ai_matched = True
+                        ai_match_key = ('doi', doi_key)
                         dblp_ai_matched_dois.add(doi_key)
-                    if not ai_matched:
+                    else:
                         nt = normalize_title(oa_title) if oa_title else ''
                         if nt and nt in dblp_ai_titles:
-                            ai_matched = True
+                            ai_match_key = ('title', nt)
                             dblp_ai_matched_titles.add(nt)
-                    if ai_matched:
-                        overlap_ai_by_year[pub_year] += 1
+                    if ai_match_key is not None and ai_match_key not in matched_dblp_ai:
+                        matched_dblp_ai.add(ai_match_key)
 
     elapsed = time.time() - t0
     print(f"\nOpenAlex scan done: {n_oa_total:,} papers in {elapsed:.0f}s", file=sys.stderr)
 
     # ── 3. Compute per-year stats ────────────────────────────────────────
     years = list(range(YEAR_MIN, YEAR_MAX + 1))
+
+    # Reconstruct per-year overlap counts from matched sets
+    overlap_all_by_year = defaultdict(int)
+    for kind, key in matched_dblp_all:
+        if kind == 'doi':
+            y = dblp_doi_to_year[key]
+        else:
+            y = dblp_title_to_year[key]
+        overlap_all_by_year[y] += 1
+
+    overlap_ai_by_year = defaultdict(int)
+    for kind, key in matched_dblp_ai:
+        if kind == 'doi':
+            y = dblp_ai_doi_to_year[key]
+        else:
+            y = dblp_ai_title_to_year[key]
+        overlap_ai_by_year[y] += 1
 
     # All papers
     rows_all = []
