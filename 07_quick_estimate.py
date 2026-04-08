@@ -1,111 +1,155 @@
 """
-Quick estimate of DBLP-only AI papers WITHOUT scanning OpenAlex.
+Quick DBLP-only statistics (no OpenAlex scan).
 
-Logic: DBLP AI papers with a DOI are almost certainly in OpenAlex
-(OpenAlex ingests from Crossref/DOI). Papers without a DOI are
-likely DBLP-only (workshops, some conference papers, etc.).
+For each year reports:
+  - total DBLP papers
+  - DBLP AI papers (count + % of total)
+  - of AI: how many conference papers (count + %)
+  - of AI: how many lack a DOI (count + %)
+  - of AI conference papers: how many lack a DOI (count + %)
 
-This gives a fast lower-bound estimate of the DBLP-OpenAlex gap.
+The "no DOI" count is a fast lower-bound proxy for "not in OpenAlex":
+OpenAlex ingests primarily from Crossref/DOI, so a paper without a DOI
+is very likely absent from OA.
 
-Input:  data/parsed/dblp_ai_papers.csv (from step 03)
-Output: prints table + saves data/output/quick_estimate.csv
+Inputs:
+  data/parsed/dblp_papers.csv     (from step 02)
+  data/parsed/dblp_ai_papers.csv  (from step 03)
 
-Usage:
-    python 07_quick_estimate.py
+Outputs:
+  data/output/quick_estimate.csv
+  data/output/quick_estimate.txt
 """
 
 from __future__ import annotations
 
 import csv
-import sys
 from collections import defaultdict
+
 from dblp_config import PARSED_DIR, OUTPUT_DIR, YEAR_MIN, YEAR_MAX
 
 
 def main():
-    ai_csv = PARSED_DIR / 'dblp_ai_papers.csv'
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    years = list(range(YEAR_MIN, YEAR_MAX + 1))
 
-    # year -> {total, has_doi, no_doi, conf_total, conf_has_doi, conf_no_doi}
-    stats = defaultdict(lambda: defaultdict(int))
-    # Also track venue type breakdown
-    venue_no_doi = defaultdict(int)  # venue -> count of no-DOI papers
-
-    with open(ai_csv, 'r', encoding='utf-8') as f:
+    # Total DBLP papers per year (from step 02)
+    total_by_year: dict[int, int] = defaultdict(int)
+    with open(PARSED_DIR / 'dblp_papers.csv', 'r', encoding='utf-8') as f:
         for row in csv.DictReader(f):
-            year = int(row['year'])
+            try:
+                y = int(row['year'])
+            except (ValueError, KeyError):
+                continue
+            if YEAR_MIN <= y <= YEAR_MAX:
+                total_by_year[y] += 1
+
+    # AI paper breakdown per year (from step 03)
+    stats = defaultdict(lambda: defaultdict(int))
+    venue_no_doi: dict[str, int] = defaultdict(int)
+
+    with open(PARSED_DIR / 'dblp_ai_papers.csv', 'r', encoding='utf-8') as f:
+        for row in csv.DictReader(f):
+            try:
+                y = int(row['year'])
+            except (ValueError, KeyError):
+                continue
+            if not (YEAR_MIN <= y <= YEAR_MAX):
+                continue
+
             has_doi = bool(row.get('doi', '').strip())
             is_conf = row.get('venue_type', '') == 'conference'
 
-            stats[year]['total'] += 1
+            s = stats[y]
+            s['ai'] += 1
             if has_doi:
-                stats[year]['has_doi'] += 1
+                s['ai_doi'] += 1
             else:
-                stats[year]['no_doi'] += 1
-
+                s['ai_nodoi'] += 1
             if is_conf:
-                stats[year]['conf_total'] += 1
+                s['conf'] += 1
                 if has_doi:
-                    stats[year]['conf_has_doi'] += 1
+                    s['conf_doi'] += 1
                 else:
-                    stats[year]['conf_no_doi'] += 1
-
+                    s['conf_nodoi'] += 1
             if not has_doi:
-                venue = row.get('venue', '(unknown)')
-                venue_no_doi[venue] += 1
+                venue_no_doi[row.get('venue', '(unknown)')] += 1
 
-    years = list(range(YEAR_MIN, YEAR_MAX + 1))
+    # ── Print table ──────────────────────────────────────────────────────
+    header = (f"{'Year':>6} {'DBLP':>10} {'AI':>9} {'AI%':>6} "
+              f"{'Conf':>9} {'Conf/AI%':>9} "
+              f"{'AI-noDOI':>10} {'noDOI%':>7} "
+              f"{'Conf-noDOI':>12} {'cnoDOI%':>8}")
+    sep = "-" * len(header)
 
-    # Print table
-    print("=" * 90)
-    print("Quick Estimate: DBLP AI Papers — DOI coverage as proxy for OpenAlex overlap")
-    print("=" * 90)
-    print(f"{'Year':>6} {'Total':>8} {'w/ DOI':>8} {'no DOI':>8} {'no DOI%':>8} "
-          f"{'Conf':>8} {'Conf noDOI':>10} {'Conf noDOI%':>11}")
-    print("-" * 90)
+    lines = []
+    lines.append("=" * len(header))
+    lines.append("DBLP AI papers — per-year breakdown (no OpenAlex needed)")
+    lines.append("=" * len(header))
+    lines.append(header)
+    lines.append(sep)
 
     totals = defaultdict(int)
     for y in years:
         s = stats[y]
-        t = s['total']
-        d = s['has_doi']
-        nd = s['no_doi']
-        ct = s['conf_total']
-        cnd = s['conf_no_doi']
-        pct = 100 * nd / max(t, 1)
-        cpct = 100 * cnd / max(ct, 1)
-        print(f"{y:>6} {t:>8,} {d:>8,} {nd:>8,} {pct:>7.1f}% "
-              f"{ct:>8,} {cnd:>10,} {cpct:>10.1f}%")
-        for k in ['total', 'has_doi', 'no_doi', 'conf_total', 'conf_no_doi']:
-            totals[k] += s[k]
+        t = total_by_year[y]
+        ai = s['ai']
+        cf = s['conf']
+        ai_nd = s['ai_nodoi']
+        cf_nd = s['conf_nodoi']
+        lines.append(
+            f"{y:>6} {t:>10,} {ai:>9,} {100*ai/max(t,1):>5.1f}% "
+            f"{cf:>9,} {100*cf/max(ai,1):>8.1f}% "
+            f"{ai_nd:>10,} {100*ai_nd/max(ai,1):>6.1f}% "
+            f"{cf_nd:>12,} {100*cf_nd/max(cf,1):>7.1f}%"
+        )
+        totals['dblp'] += t
+        totals['ai'] += ai
+        totals['conf'] += cf
+        totals['ai_nd'] += ai_nd
+        totals['conf_nd'] += cf_nd
 
-    print("-" * 90)
-    print(f"{'TOTAL':>6} {totals['total']:>8,} {totals['has_doi']:>8,} {totals['no_doi']:>8,} "
-          f"{100*totals['no_doi']/max(totals['total'],1):>7.1f}% "
-          f"{totals['conf_total']:>8,} {totals['conf_no_doi']:>10,} "
-          f"{100*totals['conf_no_doi']/max(totals['conf_total'],1):>10.1f}%")
+    lines.append(sep)
+    lines.append(
+        f"{'TOTAL':>6} {totals['dblp']:>10,} {totals['ai']:>9,} "
+        f"{100*totals['ai']/max(totals['dblp'],1):>5.1f}% "
+        f"{totals['conf']:>9,} {100*totals['conf']/max(totals['ai'],1):>8.1f}% "
+        f"{totals['ai_nd']:>10,} {100*totals['ai_nd']/max(totals['ai'],1):>6.1f}% "
+        f"{totals['conf_nd']:>12,} {100*totals['conf_nd']/max(totals['conf'],1):>7.1f}%"
+    )
+    lines.append("")
+    lines.append(f"~{totals['ai_nd']:,} DBLP AI papers have no DOI (likely NOT in OpenAlex)")
+    lines.append(f"~{totals['conf_nd']:,} of those are conference papers")
 
-    print(f"\n  → ~{totals['no_doi']:,} DBLP AI papers likely NOT in OpenAlex")
-    print(f"  → ~{totals['conf_no_doi']:,} of those are conference papers")
+    lines.append("")
+    lines.append("--- Top 20 venues among no-DOI AI papers ---")
+    for venue, cnt in sorted(venue_no_doi.items(), key=lambda x: -x[1])[:20]:
+        lines.append(f"  {cnt:>6,}  {venue}")
 
-    # Top venues with no-DOI papers
-    print(f"\n--- Top 20 venues with most no-DOI AI papers ---")
-    for venue, count in sorted(venue_no_doi.items(), key=lambda x: -x[1])[:20]:
-        print(f"  {count:>6,}  {venue}")
+    report = '\n'.join(lines)
+    print(report)
 
-    # Save CSV
-    out_path = OUTPUT_DIR / 'quick_estimate.csv'
-    with open(out_path, 'w', newline='') as f:
+    (OUTPUT_DIR / 'quick_estimate.txt').write_text(report + '\n')
+
+    # CSV
+    out = OUTPUT_DIR / 'quick_estimate.csv'
+    with open(out, 'w', newline='') as f:
         w = csv.writer(f)
-        w.writerow(['year', 'ai_total', 'has_doi', 'no_doi', 'no_doi_pct',
-                     'conf_total', 'conf_no_doi', 'conf_no_doi_pct'])
+        w.writerow(['year', 'dblp_total', 'ai', 'ai_pct',
+                    'conf', 'conf_of_ai_pct',
+                    'ai_no_doi', 'ai_no_doi_pct',
+                    'conf_no_doi', 'conf_no_doi_pct'])
         for y in years:
             s = stats[y]
-            w.writerow([y, s['total'], s['has_doi'], s['no_doi'],
-                         f"{100*s['no_doi']/max(s['total'],1):.1f}",
-                         s['conf_total'], s['conf_no_doi'],
-                         f"{100*s['conf_no_doi']/max(s['conf_total'],1):.1f}"])
-    print(f"\nSaved: {out_path}")
+            t = total_by_year[y]
+            ai = s['ai']
+            cf = s['conf']
+            w.writerow([y, t, ai, f"{100*ai/max(t,1):.1f}",
+                        cf, f"{100*cf/max(ai,1):.1f}",
+                        s['ai_nodoi'], f"{100*s['ai_nodoi']/max(ai,1):.1f}",
+                        s['conf_nodoi'], f"{100*s['conf_nodoi']/max(cf,1):.1f}"])
+    print(f"\nSaved: {out}")
+    print(f"Saved: {OUTPUT_DIR / 'quick_estimate.txt'}")
 
 
 if __name__ == '__main__':

@@ -15,3 +15,7 @@ DATA_DIR = Path('/path/to/dblp-analysis/data')
 
 # OpenAlex bulk data (works/ directory containing .gz files)
 OPENALEX_DIR = Path('/path/to/openalex/works')
+
+# Email for OpenAlex "polite pool" (higher rate limits on the REST API).
+# See https://docs.openalex.org/how-to-use-the-api/rate-limits-and-authentication
+OPENALEX_MAILTO = 'you@example.com'

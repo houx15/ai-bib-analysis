@@ -9,7 +9,11 @@ Copy config.example.py → config.py and edit for your machine.
 from __future__ import annotations
 
 import re
-from config import DATA_DIR, OPENALEX_DIR
+try:
+    from config import DATA_DIR, OPENALEX_DIR, OPENALEX_MAILTO
+except ImportError:
+    from config import DATA_DIR, OPENALEX_DIR
+    OPENALEX_MAILTO = 'you@example.com'
 
 # ── Derived paths ────────────────────────────────────────────────────────────
 RAW_DIR        = DATA_DIR / 'raw'          # downloaded dblp files

@@ -1,31 +1,38 @@
 """
-Step 6: Compare DBLP vs OpenAlex coverage, year by year.
+Step 6: For each DBLP AI paper, find its match in OpenAlex.
 
-Builds DOI and normalized-title indices from DBLP parsed CSV, then scans
-OpenAlex bulk data to find matches.  Reports per-year:
+This is DBLP-AI-centric: we walk through DBLP AI papers and ask
+"does OpenAlex have this paper?" using two match strategies:
 
-  - DBLP total / OpenAlex total (all papers, not just AI)
-  - Overlap (in both)
-  - DBLP-only / OpenAlex-only
-  - Same breakdown restricted to AI papers
+  (a) DOI exact match
+  (b) Normalized-title exact match (lowercase, [a-z0-9 ] only, collapsed ws)
 
-Produces:
-  data/output/coverage_all_papers.csv
-  data/output/coverage_ai_papers.csv
-  data/output/coverage_report.txt
-  data/output/fig_coverage_comparison.png
-  data/output/dblp_only_ai_sample.csv      (sample of DBLP-only AI papers for inspection)
+Per-year output:
+  - DBLP AI total
+  - matched_by_doi               (DOI path alone)
+  - matched_by_doi_or_title      (either path)
+  - unmatched                    (neither path — candidates for Search API in step 08)
+
+Tracking is keyed on DBLP key (unique per DBLP paper) so the same DBLP
+paper cannot be double-counted even if multiple OpenAlex records hit it
+through different paths.
+
+Also tracks all-papers coverage (DBLP vs OpenAlex totals per year) as a
+secondary sanity metric.
+
+Outputs:
+  data/output/coverage_ai_papers.csv      (per-year AI match breakdown)
+  data/output/coverage_all_papers.csv     (per-year totals)
+  data/output/coverage_report.txt         (human-readable)
+  data/output/coverage_live.txt           (written every 20 files during run)
+  data/output/dblp_ai_unmatched.csv       (unmatched DBLP AI papers — input for step 08)
 
 Usage:
-    python 06_compare_dblp_openalex.py \
-        --dblp-csv data/parsed/dblp_papers.csv \
-        --openalex-dir /tigerdata/ccc/data/2018-science/data-openalex-20250227/works \
-        [--dblp-ai-csv data/parsed/dblp_ai_papers.csv]
-
-NOTE: This scans the full OpenAlex dump. Expect ~30-60 min depending on I/O.
+    python 06_compare_dblp_openalex.py
 """
 
-import argparse
+from __future__ import annotations
+
 import csv
 import gzip
 import json
@@ -35,21 +42,22 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import numpy as np
-
-from dblp_config import YEAR_MIN, YEAR_MAX, PARSED_DIR, OUTPUT_DIR, OPENALEX_DIR, is_ai_title, is_ai_venue
+from dblp_config import YEAR_MIN, YEAR_MAX, PARSED_DIR, OUTPUT_DIR, OPENALEX_DIR
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
+_NON_ALNUM = re.compile(r'[^a-z0-9\s]')
+_WS = re.compile(r'\s+')
+
+
 def normalize_title(title: str) -> str:
-    """Lowercase, strip punctuation, collapse whitespace."""
-    t = title.lower().strip()
-    t = re.sub(r'[^\w\s]', '', t)
-    t = re.sub(r'\s+', ' ', t)
+    """Lowercase, keep only [a-z0-9 ], collapse whitespace."""
+    if not title:
+        return ''
+    t = title.lower()
+    t = _NON_ALNUM.sub(' ', t)
+    t = _WS.sub(' ', t).strip()
     return t
 
 
@@ -57,143 +65,137 @@ def extract_doi_key(doi_str: str) -> str:
     """Extract bare DOI (e.g. '10.1234/foo') from a URL or raw DOI string."""
     if not doi_str:
         return ''
-    doi_str = doi_str.strip()
-    for prefix in ['https://doi.org/', 'http://doi.org/',
-                    'http://dx.doi.org/', 'https://dx.doi.org/']:
-        if doi_str.lower().startswith(prefix):
-            return doi_str[len(prefix):].lower()
-    if doi_str.startswith('10.'):
-        return doi_str.lower()
+    s = doi_str.strip().lower()
+    for prefix in ('https://doi.org/', 'http://doi.org/',
+                   'http://dx.doi.org/', 'https://dx.doi.org/'):
+        if s.startswith(prefix):
+            return s[len(prefix):]
+    if s.startswith('10.'):
+        return s
     return ''
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description='Compare DBLP vs OpenAlex coverage')
-    parser.add_argument('--dblp-csv', default=str(PARSED_DIR / 'dblp_papers.csv'),
-                        help='Parsed DBLP CSV from step 02 (all papers, not just AI)')
-    parser.add_argument('--dblp-ai-csv', default=str(PARSED_DIR / 'dblp_ai_papers.csv'),
-                        help='Filtered DBLP AI papers from step 03')
-    parser.add_argument('--openalex-dir', default=str(OPENALEX_DIR),
-                        help='Path to OpenAlex works/ directory with .gz files')
-    args = parser.parse_args()
-
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    years = list(range(YEAR_MIN, YEAR_MAX + 1))
 
-    # ── 1. Load DBLP papers ──────────────────────────────────────────────
-    print("Loading DBLP papers...", file=sys.stderr)
+    dblp_csv = PARSED_DIR / 'dblp_papers.csv'
+    dblp_ai_csv = PARSED_DIR / 'dblp_ai_papers.csv'
 
-    # For ALL papers: build year-indexed DOI and title sets
-    # doi_key -> year
-    dblp_doi_to_year = {}
-    # normalized_title -> year (first occurrence wins if duplicates)
-    dblp_title_to_year = {}
-    # year -> count of all DBLP papers
-    dblp_all_by_year = defaultdict(int)
+    # ── 1. Load DBLP (all papers) — for per-year totals + title/DOI → year map
+    print("Loading DBLP (all papers)...", file=sys.stderr)
+    dblp_all_by_year: dict[int, int] = defaultdict(int)
+    # For all-papers overlap, track which DBLP keys matched.
+    all_doi_to_dblp_key: dict[str, str] = {}
+    all_title_to_dblp_key: dict[str, str] = {}
+    all_dblp_key_to_year: dict[str, int] = {}
 
-    with open(args.dblp_csv, 'r', encoding='utf-8') as f:
+    with open(dblp_csv, 'r', encoding='utf-8') as f:
         for row in csv.DictReader(f):
             year = int(row['year'])
+            if year < YEAR_MIN or year > YEAR_MAX:
+                continue
             dblp_all_by_year[year] += 1
+            dblp_key = row.get('dblp_key', '')
+            if not dblp_key:
+                continue
+            all_dblp_key_to_year[dblp_key] = year
 
             doi_key = extract_doi_key(row.get('doi', ''))
-            if doi_key:
-                dblp_doi_to_year[doi_key] = year
-
+            if doi_key and doi_key not in all_doi_to_dblp_key:
+                all_doi_to_dblp_key[doi_key] = dblp_key
             nt = normalize_title(row.get('title', ''))
-            if nt and nt not in dblp_title_to_year:
-                dblp_title_to_year[nt] = year
+            if nt and nt not in all_title_to_dblp_key:
+                all_title_to_dblp_key[nt] = dblp_key
 
-    print(f"  DBLP all papers: {sum(dblp_all_by_year.values()):,}", file=sys.stderr)
-    print(f"  DBLP DOI index:  {len(dblp_doi_to_year):,}", file=sys.stderr)
-    print(f"  DBLP title index: {len(dblp_title_to_year):,}", file=sys.stderr)
+    print(f"  DBLP total: {sum(dblp_all_by_year.values()):,}", file=sys.stderr)
+    print(f"  DOI index : {len(all_doi_to_dblp_key):,}", file=sys.stderr)
+    print(f"  Title idx : {len(all_title_to_dblp_key):,}", file=sys.stderr)
 
-    # For AI papers: separate sets + year lookup
-    dblp_ai_dois = set()
-    dblp_ai_titles = set()
-    dblp_ai_doi_to_year = {}
-    dblp_ai_title_to_year = {}
-    dblp_ai_by_year = defaultdict(int)
-    dblp_ai_rows_by_key = {}  # dblp_key -> row (for sampling DBLP-only later)
+    # ── 2. Load DBLP AI papers ────────────────────────────────────────────
+    print("Loading DBLP AI papers...", file=sys.stderr)
+    dblp_ai_by_year: dict[int, int] = defaultdict(int)
+    ai_doi_to_dblp_key: dict[str, str] = {}
+    ai_title_to_dblp_key: dict[str, str] = {}
+    ai_dblp_key_to_year: dict[str, int] = {}
+    ai_rows_by_key: dict[str, dict] = {}
 
-    ai_csv_path = Path(args.dblp_ai_csv)
-    if ai_csv_path.exists():
-        with open(ai_csv_path, 'r', encoding='utf-8') as f:
-            for row in csv.DictReader(f):
-                year = int(row['year'])
-                dblp_ai_by_year[year] += 1
-                doi_key = extract_doi_key(row.get('doi', ''))
-                if doi_key:
-                    dblp_ai_dois.add(doi_key)
-                    if doi_key not in dblp_ai_doi_to_year:
-                        dblp_ai_doi_to_year[doi_key] = year
-                nt = normalize_title(row.get('title', ''))
-                if nt:
-                    dblp_ai_titles.add(nt)
-                    if nt not in dblp_ai_title_to_year:
-                        dblp_ai_title_to_year[nt] = year
-                dblp_ai_rows_by_key[row.get('dblp_key', '')] = row
-        print(f"  DBLP AI papers:  {sum(dblp_ai_by_year.values()):,}", file=sys.stderr)
-    else:
-        print(f"  WARNING: {ai_csv_path} not found, AI-level comparison will be skipped", file=sys.stderr)
+    with open(dblp_ai_csv, 'r', encoding='utf-8') as f:
+        for row in csv.DictReader(f):
+            year = int(row['year'])
+            if year < YEAR_MIN or year > YEAR_MAX:
+                continue
+            dblp_ai_by_year[year] += 1
+            dblp_key = row.get('dblp_key', '')
+            if not dblp_key:
+                continue
+            ai_dblp_key_to_year[dblp_key] = year
+            ai_rows_by_key[dblp_key] = row
 
-    # ── 2. Scan OpenAlex ─────────────────────────────────────────────────
-    print("\nScanning OpenAlex...", file=sys.stderr)
-    oa_dir = Path(args.openalex_dir)
+            doi_key = extract_doi_key(row.get('doi', ''))
+            if doi_key and doi_key not in ai_doi_to_dblp_key:
+                ai_doi_to_dblp_key[doi_key] = dblp_key
+            nt = normalize_title(row.get('title', ''))
+            if nt and nt not in ai_title_to_dblp_key:
+                ai_title_to_dblp_key[nt] = dblp_key
+
+    print(f"  DBLP AI total: {sum(dblp_ai_by_year.values()):,}", file=sys.stderr)
+
+    # ── 3. Scan OpenAlex ─────────────────────────────────────────────────
+    oa_dir = Path(OPENALEX_DIR)
     gz_files = sorted(oa_dir.glob('**/*.gz'))
-    print(f"  Found {len(gz_files)} .gz files", file=sys.stderr)
+    print(f"\nScanning {len(gz_files)} OpenAlex .gz files...", file=sys.stderr)
 
-    # Per-year counters
-    oa_all_by_year = defaultdict(int)          # total OA papers
-    oa_ai_by_year = defaultdict(int)           # OA AI papers (title match)
+    oa_all_by_year: dict[int, int] = defaultdict(int)
 
-    # Track which DBLP papers have been matched (to avoid double-counting)
-    # Use the match key (doi or title) as identifier
-    matched_dblp_all = set()    # set of (doi_key or norm_title) for all papers
-    matched_dblp_ai = set()     # set of (doi_key or norm_title) for AI papers
+    # All-papers overlap: sets of DBLP keys matched
+    all_matched_by_doi: set[str] = set()
+    all_matched_by_title: set[str] = set()
 
-    # Track which DBLP AI papers were found in OA (for sampling DBLP-only)
-    dblp_ai_matched_dois = set()
-    dblp_ai_matched_titles = set()
+    # AI overlap: sets of DBLP AI keys matched
+    ai_matched_by_doi: set[str] = set()
+    ai_matched_by_title: set[str] = set()
 
-    years = list(range(YEAR_MIN, YEAR_MAX + 1))
     live_path = OUTPUT_DIR / 'coverage_live.txt'
 
-    def write_live_progress(fi_done, n_files, n_scanned, elapsed):
-        """Write a live progress file you can cat anytime during the run."""
-        # Reconstruct per-year overlap from matched sets so far
-        ov_all = defaultdict(int)
-        for kind, key in matched_dblp_all:
-            y = dblp_doi_to_year[key] if kind == 'doi' else dblp_title_to_year[key]
-            ov_all[y] += 1
-        ov_ai = defaultdict(int)
-        for kind, key in matched_dblp_ai:
-            y = dblp_ai_doi_to_year[key] if kind == 'doi' else dblp_ai_title_to_year[key]
-            ov_ai[y] += 1
+    def write_live(fi_done: int, n_files: int, n_oa: int, elapsed: float) -> None:
+        # Build per-year counts from matched DBLP keys
+        ai_doi_year: dict[int, int] = defaultdict(int)
+        ai_either_year: dict[int, int] = defaultdict(int)
+        ai_either_keys = ai_matched_by_doi | ai_matched_by_title
+        for k in ai_matched_by_doi:
+            ai_doi_year[ai_dblp_key_to_year[k]] += 1
+        for k in ai_either_keys:
+            ai_either_year[ai_dblp_key_to_year[k]] += 1
+
+        all_either_year: dict[int, int] = defaultdict(int)
+        for k in (all_matched_by_doi | all_matched_by_title):
+            all_either_year[all_dblp_key_to_year[k]] += 1
 
         lines = []
-        lines.append(f"=== LIVE PROGRESS: {fi_done}/{n_files} files | {n_scanned:,} OA papers | {elapsed:.0f}s ===")
-        lines.append(f"(numbers will increase as more files are scanned)\n")
-
-        lines.append(f"{'Year':>6} {'DBLP-AI':>9} {'OA-AI':>9} {'Both':>9} {'DBLP-only':>10} {'OA-only':>10} {'DBLP⊂OA':>8}")
+        lines.append(f"=== LIVE: {fi_done}/{n_files} files | {n_oa:,} OA papers | {elapsed:.0f}s ===")
+        lines.append("(counts grow monotonically as more files are scanned)\n")
+        lines.append("--- DBLP AI papers matched to OpenAlex ---")
+        lines.append(f"{'Year':>6} {'DBLP-AI':>9} {'DOI-match':>10} {'DOI%':>7} "
+                     f"{'DOI|Title':>10} {'Either%':>8} {'Unmatched':>10}")
         lines.append("-" * 70)
         for y in years:
             d = dblp_ai_by_year[y]
-            o = oa_ai_by_year[y]
-            b = ov_ai[y]
-            lines.append(f"{y:>6} {d:>9,} {o:>9,} {b:>9,} {d-b:>10,} {o-b:>10,} "
-                          f"{100*b/max(d,1):>7.1f}%")
+            md = ai_doi_year[y]
+            me = ai_either_year[y]
+            lines.append(f"{y:>6} {d:>9,} {md:>10,} {100*md/max(d,1):>6.1f}% "
+                         f"{me:>10,} {100*me/max(d,1):>7.1f}% {d-me:>10,}")
         lines.append("")
-        lines.append(f"{'Year':>6} {'DBLP':>9} {'OA':>9} {'Both':>9} {'DBLP-only':>10} {'OA-only':>10} {'DBLP⊂OA':>8}")
-        lines.append("-" * 70)
+        lines.append("--- ALL papers: DBLP matched to OpenAlex ---")
+        lines.append(f"{'Year':>6} {'DBLP':>10} {'OA':>12} {'Both':>10} {'DBLP%':>7}")
+        lines.append("-" * 55)
         for y in years:
             d = dblp_all_by_year[y]
             o = oa_all_by_year[y]
-            b = ov_all[y]
-            lines.append(f"{y:>6} {d:>9,} {o:>9,} {b:>9,} {d-b:>10,} {o-b:>10,} "
-                          f"{100*b/max(d,1):>7.1f}%")
-
+            b = all_either_year[y]
+            lines.append(f"{y:>6} {d:>10,} {o:>12,} {b:>10,} {100*b/max(d,1):>6.1f}%")
         with open(live_path, 'w') as f:
             f.write('\n'.join(lines) + '\n')
 
@@ -203,12 +205,11 @@ def main():
     for fi, gz_path in enumerate(gz_files):
         if (fi + 1) % 20 == 0:
             elapsed = time.time() - t0
-            print(f"  file {fi+1}/{len(gz_files)} | OA scanned: {n_oa_total:,} | "
-                  f"overlap(all): {len(matched_dblp_all):,} | "
-                  f"overlap(ai): {len(matched_dblp_ai):,} | "
-                  f"{elapsed:.0f}s",
+            print(f"  file {fi+1}/{len(gz_files)} | OA={n_oa_total:,} | "
+                  f"AI matched doi={len(ai_matched_by_doi):,} "
+                  f"title={len(ai_matched_by_title):,} | {elapsed:.0f}s",
                   file=sys.stderr)
-            write_live_progress(fi + 1, len(gz_files), n_oa_total, elapsed)
+            write_live(fi + 1, len(gz_files), n_oa_total, elapsed)
 
         with gzip.open(gz_path, 'rt', encoding='utf-8') as gf:
             for line in gf:
@@ -224,107 +225,64 @@ def main():
                 n_oa_total += 1
                 oa_all_by_year[pub_year] += 1
 
-                # Check if this OA paper is AI-related (by title, same logic as original study)
-                oa_title = work.get('title', '') or ''
-                oa_is_ai = is_ai_title(oa_title)
-                if oa_is_ai:
-                    oa_ai_by_year[pub_year] += 1
-
-                # Match against DBLP (all papers)
                 oa_doi = work.get('doi', '') or ''
                 doi_key = extract_doi_key(oa_doi)
-                match_key = None  # the key used to identify this DBLP paper
+                oa_title = work.get('title', '') or ''
+                nt = normalize_title(oa_title)
 
-                if doi_key and doi_key in dblp_doi_to_year:
-                    match_key = ('doi', doi_key)
-                else:
-                    nt = normalize_title(oa_title)
-                    if nt and nt in dblp_title_to_year:
-                        match_key = ('title', nt)
+                # --- All-papers matching ---
+                if doi_key:
+                    k = all_doi_to_dblp_key.get(doi_key)
+                    if k is not None:
+                        all_matched_by_doi.add(k)
+                if nt:
+                    k = all_title_to_dblp_key.get(nt)
+                    if k is not None:
+                        all_matched_by_title.add(k)
 
-                if match_key is not None and match_key not in matched_dblp_all:
-                    matched_dblp_all.add(match_key)
-
-                # Match against DBLP AI papers specifically
-                if dblp_ai_dois or dblp_ai_titles:
-                    ai_match_key = None
-                    if doi_key and doi_key in dblp_ai_dois:
-                        ai_match_key = ('doi', doi_key)
-                        dblp_ai_matched_dois.add(doi_key)
-                    else:
-                        nt = normalize_title(oa_title) if oa_title else ''
-                        if nt and nt in dblp_ai_titles:
-                            ai_match_key = ('title', nt)
-                            dblp_ai_matched_titles.add(nt)
-                    if ai_match_key is not None and ai_match_key not in matched_dblp_ai:
-                        matched_dblp_ai.add(ai_match_key)
+                # --- DBLP AI matching ---
+                if doi_key:
+                    k = ai_doi_to_dblp_key.get(doi_key)
+                    if k is not None:
+                        ai_matched_by_doi.add(k)
+                if nt:
+                    k = ai_title_to_dblp_key.get(nt)
+                    if k is not None:
+                        ai_matched_by_title.add(k)
 
     elapsed = time.time() - t0
-    print(f"\nOpenAlex scan done: {n_oa_total:,} papers in {elapsed:.0f}s", file=sys.stderr)
+    print(f"\nDone: {n_oa_total:,} OA papers in {elapsed:.0f}s", file=sys.stderr)
 
-    # ── 3. Compute per-year stats ────────────────────────────────────────
-    years = list(range(YEAR_MIN, YEAR_MAX + 1))
+    # ── 4. Build per-year tables ─────────────────────────────────────────
+    ai_doi_year: dict[int, int] = defaultdict(int)
+    for k in ai_matched_by_doi:
+        ai_doi_year[ai_dblp_key_to_year[k]] += 1
 
-    # Reconstruct per-year overlap counts from matched sets
-    overlap_all_by_year = defaultdict(int)
-    for kind, key in matched_dblp_all:
-        if kind == 'doi':
-            y = dblp_doi_to_year[key]
-        else:
-            y = dblp_title_to_year[key]
-        overlap_all_by_year[y] += 1
+    ai_either_keys = ai_matched_by_doi | ai_matched_by_title
+    ai_either_year: dict[int, int] = defaultdict(int)
+    for k in ai_either_keys:
+        ai_either_year[ai_dblp_key_to_year[k]] += 1
 
-    overlap_ai_by_year = defaultdict(int)
-    for kind, key in matched_dblp_ai:
-        if kind == 'doi':
-            y = dblp_ai_doi_to_year[key]
-        else:
-            y = dblp_ai_title_to_year[key]
-        overlap_ai_by_year[y] += 1
+    all_either_keys = all_matched_by_doi | all_matched_by_title
+    all_either_year: dict[int, int] = defaultdict(int)
+    for k in all_either_keys:
+        all_either_year[all_dblp_key_to_year[k]] += 1
 
-    # All papers
-    rows_all = []
-    for y in years:
-        dblp = dblp_all_by_year[y]
-        oa = oa_all_by_year[y]
-        both = overlap_all_by_year[y]
-        dblp_only = dblp - both
-        oa_only = oa - both
-        rows_all.append({
-            'year': y,
-            'dblp_total': dblp,
-            'openalex_total': oa,
-            'in_both': both,
-            'dblp_only': dblp_only,
-            'openalex_only': oa_only,
-            'dblp_coverage_of_oa': f"{100*both/max(oa,1):.1f}%",
-            'oa_coverage_of_dblp': f"{100*both/max(dblp,1):.1f}%",
-        })
-
-    csv_all = OUTPUT_DIR / 'coverage_all_papers.csv'
-    with open(csv_all, 'w', newline='') as f:
-        w = csv.DictWriter(f, fieldnames=rows_all[0].keys())
-        w.writeheader()
-        w.writerows(rows_all)
-    print(f"Saved: {csv_all}")
-
-    # AI papers
+    # AI CSV
     rows_ai = []
     for y in years:
-        dblp = dblp_ai_by_year[y]
-        oa = oa_ai_by_year[y]
-        both = overlap_ai_by_year[y]
-        dblp_only = dblp - both
-        oa_only = oa - both
+        d = dblp_ai_by_year[y]
+        md = ai_doi_year[y]
+        me = ai_either_year[y]
         rows_ai.append({
             'year': y,
-            'dblp_ai_total': dblp,
-            'openalex_ai_total': oa,
-            'in_both': both,
-            'dblp_only': dblp_only,
-            'openalex_only': oa_only,
-            'dblp_coverage_of_oa': f"{100*both/max(oa,1):.1f}%",
-            'oa_coverage_of_dblp': f"{100*both/max(dblp,1):.1f}%",
+            'dblp_ai_total': d,
+            'matched_by_doi': md,
+            'matched_by_doi_pct': f"{100*md/max(d,1):.1f}",
+            'matched_by_doi_or_title': me,
+            'matched_either_pct': f"{100*me/max(d,1):.1f}",
+            'unmatched': d - me,
+            'unmatched_pct': f"{100*(d-me)/max(d,1):.1f}",
         })
 
     csv_ai = OUTPUT_DIR / 'coverage_ai_papers.csv'
@@ -334,100 +292,73 @@ def main():
         w.writerows(rows_ai)
     print(f"Saved: {csv_ai}")
 
-    # ── 4. Text report ───────────────────────────────────────────────────
+    # ALL CSV
+    rows_all = []
+    for y in years:
+        d = dblp_all_by_year[y]
+        o = oa_all_by_year[y]
+        b = all_either_year[y]
+        rows_all.append({
+            'year': y,
+            'dblp_total': d,
+            'openalex_total': o,
+            'in_both': b,
+            'dblp_only': d - b,
+            'dblp_in_oa_pct': f"{100*b/max(d,1):.1f}",
+        })
+    csv_all = OUTPUT_DIR / 'coverage_all_papers.csv'
+    with open(csv_all, 'w', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=rows_all[0].keys())
+        w.writeheader()
+        w.writerows(rows_all)
+    print(f"Saved: {csv_all}")
+
+    # ── 5. Text report ───────────────────────────────────────────────────
     lines = []
-    lines.append("=" * 70)
-    lines.append("DBLP vs OpenAlex Coverage Comparison")
-    lines.append("=" * 70)
-
-    lines.append("\n--- ALL PAPERS (2015-2025) ---")
-    lines.append(f"{'Year':>6} {'DBLP':>10} {'OpenAlex':>10} {'Both':>10} {'DBLP-only':>10} {'OA-only':>10} {'OA⊂DBLP':>8} {'DBLP⊂OA':>8}")
-    lines.append("-" * 78)
-    for r in rows_all:
-        lines.append(f"{r['year']:>6} {r['dblp_total']:>10,} {r['openalex_total']:>10,} "
-                      f"{r['in_both']:>10,} {r['dblp_only']:>10,} {r['openalex_only']:>10,} "
-                      f"{r['dblp_coverage_of_oa']:>8} {r['oa_coverage_of_dblp']:>8}")
-
-    lines.append("\n--- AI PAPERS (2015-2025) ---")
-    lines.append(f"{'Year':>6} {'DBLP-AI':>10} {'OA-AI':>10} {'Both':>10} {'DBLP-only':>10} {'OA-only':>10} {'OA⊂DBLP':>8} {'DBLP⊂OA':>8}")
+    lines.append("=" * 78)
+    lines.append("DBLP AI papers → OpenAlex match (by DBLP key, no double-counting)")
+    lines.append("=" * 78)
+    lines.append(f"{'Year':>6} {'DBLP-AI':>9} {'DOI':>9} {'DOI%':>7} "
+                 f"{'DOI|Title':>10} {'Either%':>8} {'Unmatched':>10} {'Unm%':>7}")
     lines.append("-" * 78)
     for r in rows_ai:
-        lines.append(f"{r['year']:>6} {r['dblp_ai_total']:>10,} {r['openalex_ai_total']:>10,} "
-                      f"{r['in_both']:>10,} {r['dblp_only']:>10,} {r['openalex_only']:>10,} "
-                      f"{r['dblp_coverage_of_oa']:>8} {r['oa_coverage_of_dblp']:>8}")
+        lines.append(f"{r['year']:>6} {r['dblp_ai_total']:>9,} "
+                     f"{r['matched_by_doi']:>9,} {r['matched_by_doi_pct']:>6}% "
+                     f"{r['matched_by_doi_or_title']:>10,} "
+                     f"{r['matched_either_pct']:>7}% "
+                     f"{r['unmatched']:>10,} {r['unmatched_pct']:>6}%")
 
-    lines.append("\nColumn legend:")
-    lines.append("  OA⊂DBLP = % of OpenAlex papers also found in DBLP")
-    lines.append("  DBLP⊂OA = % of DBLP papers also found in OpenAlex")
+    lines.append("")
+    lines.append("--- All DBLP papers → OpenAlex (sanity) ---")
+    lines.append(f"{'Year':>6} {'DBLP':>10} {'OA':>12} {'Both':>10} {'DBLP%':>7}")
+    lines.append("-" * 55)
+    for r in rows_all:
+        lines.append(f"{r['year']:>6} {r['dblp_total']:>10,} "
+                     f"{r['openalex_total']:>12,} {r['in_both']:>10,} "
+                     f"{r['dblp_in_oa_pct']:>6}%")
+
+    lines.append("")
+    lines.append("Legend:")
+    lines.append("  DOI            = DBLP AI papers matched to OA via DOI")
+    lines.append("  DOI|Title      = matched via DOI OR normalized-title exact")
+    lines.append("  Unmatched      = neither path matched (candidates for step 08 Search API)")
 
     report = '\n'.join(lines)
     print('\n' + report)
-    report_path = OUTPUT_DIR / 'coverage_report.txt'
-    with open(report_path, 'w') as f:
-        f.write(report)
-    print(f"\nSaved: {report_path}")
+    (OUTPUT_DIR / 'coverage_report.txt').write_text(report + '\n')
 
-    # ── 5. Sample of DBLP-only AI papers (for manual inspection) ─────────
-    if dblp_ai_rows_by_key:
-        matched_all = dblp_ai_matched_dois | dblp_ai_matched_titles
-        sample_rows = []
-        for key, row in dblp_ai_rows_by_key.items():
-            doi_key = extract_doi_key(row.get('doi', ''))
-            nt = normalize_title(row.get('title', ''))
-            if doi_key not in dblp_ai_matched_dois and nt not in dblp_ai_matched_titles:
-                sample_rows.append(row)
-            if len(sample_rows) >= 500:
-                break
-
-        if sample_rows:
-            sample_path = OUTPUT_DIR / 'dblp_only_ai_sample.csv'
-            with open(sample_path, 'w', newline='', encoding='utf-8') as f:
-                w = csv.DictWriter(f, fieldnames=sample_rows[0].keys())
-                w.writeheader()
-                w.writerows(sample_rows)
-            print(f"Saved: {sample_path} ({len(sample_rows)} sample DBLP-only AI papers)")
-
-    # ── 6. Plot ──────────────────────────────────────────────────────────
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-
-    # Panel A: All papers
-    ax = axes[0]
-    dblp_vals = [dblp_all_by_year[y] for y in years]
-    oa_vals = [oa_all_by_year[y] for y in years]
-    both_vals = [overlap_all_by_year[y] for y in years]
-    ax.plot(years, dblp_vals, 'o-', color='#e6550d', label='DBLP total')
-    ax.plot(years, oa_vals, 's-', color='#3182bd', label='OpenAlex total')
-    ax.plot(years, both_vals, '^--', color='#31a354', label='In both')
-    ax.set_title('A. All Papers')
-    ax.set_xlabel('Year')
-    ax.set_ylabel('Number of papers')
-    ax.legend()
-    ax.set_xticks(years)
-    ax.set_xticklabels(years, rotation=45)
-    ax.grid(True, alpha=0.3)
-
-    # Panel B: AI papers
-    ax = axes[1]
-    dblp_ai_vals = [dblp_ai_by_year[y] for y in years]
-    oa_ai_vals = [oa_ai_by_year[y] for y in years]
-    both_ai_vals = [overlap_ai_by_year[y] for y in years]
-    ax.plot(years, dblp_ai_vals, 'o-', color='#e6550d', label='DBLP AI')
-    ax.plot(years, oa_ai_vals, 's-', color='#3182bd', label='OpenAlex AI')
-    ax.plot(years, both_ai_vals, '^--', color='#31a354', label='In both')
-    ax.set_title('B. AI Papers')
-    ax.set_xlabel('Year')
-    ax.set_ylabel('Number of AI papers')
-    ax.legend()
-    ax.set_xticks(years)
-    ax.set_xticklabels(years, rotation=45)
-    ax.grid(True, alpha=0.3)
-
-    fig.suptitle('DBLP vs OpenAlex Coverage (2015–2025)', fontsize=13, y=1.02)
-    fig.tight_layout()
-    fig_path = OUTPUT_DIR / 'fig_coverage_comparison.png'
-    fig.savefig(fig_path, dpi=150, bbox_inches='tight')
-    print(f"Saved: {fig_path}")
-    plt.close(fig)
+    # ── 6. Dump unmatched DBLP AI papers for step 08 (Search API) ────────
+    unmatched_keys = set(ai_dblp_key_to_year.keys()) - ai_either_keys
+    unmatched_path = OUTPUT_DIR / 'dblp_ai_unmatched.csv'
+    if ai_rows_by_key:
+        sample_row = next(iter(ai_rows_by_key.values()))
+        fieldnames = list(sample_row.keys())
+        with open(unmatched_path, 'w', newline='', encoding='utf-8') as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames)
+            w.writeheader()
+            for k in unmatched_keys:
+                w.writerow(ai_rows_by_key[k])
+        print(f"Saved: {unmatched_path} ({len(unmatched_keys):,} unmatched)")
 
 
 if __name__ == '__main__':
