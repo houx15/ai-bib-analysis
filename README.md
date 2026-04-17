@@ -1,52 +1,52 @@
-# DBLP Bibliometric Analysis: AI Publications by Country
+# DBLP Bibliometric Analysis: AI Publications
 
-Replicates the OpenAlex-based analysis of AI publication volumes (China vs United States, 2015–2025) using DBLP as an alternative data source, and compares coverage between the two databases.
+Measures what fraction of DBLP AI papers can be recovered from OpenAlex, per year (2015–2025), using three cumulative match strategies.
 
-## Motivation
+## Goals
 
-The original study uses OpenAlex to track AI-related scientific publications by country. However, OpenAlex may undercount conference papers — the primary venue for AI research. DBLP, as a CS-focused bibliography, should have stronger conference coverage. This pipeline:
+**Task 1 — DBLP composition** (no OpenAlex needed):
+- Per year: what % of DBLP papers are AI?
+- Of AI papers, what % are conference papers?
+- Of AI papers, what % lack a DOI?
 
-1. Processes the DBLP XML dump to identify AI papers
-2. Compares DBLP vs OpenAlex coverage to quantify the gap
-3. (Optionally) cross-references with OpenAlex for country attribution
+**Task 2 — Cumulative coverage of DBLP AI papers in OpenAlex**:
+1. DOI exact match
+2. + normalized-title exact match on the DOI residual
+3. + OpenAlex Search API (fuzzy top-1) on the DOI|Title residual
+
+Algo1 ⊆ Algo2 ⊆ Algo3 — each strategy only runs on what the previous one missed.
 
 ## Pipeline
 
-Run scripts in order. Steps 01–03 and 06 are the core workflow. Steps 04–05 are for country-level analysis if needed later.
-
-| Step | Script | Description | Input | Output |
-|------|--------|-------------|-------|--------|
-| 1 | `01_download_dblp.sh` | Download DBLP XML dump (~4 GB) | — | `data/raw/dblp.xml.gz` |
-| 2 | `02_parse_dblp.py` | Parse XML into flat CSV (articles + conference papers, 2015–2025) | `dblp.xml.gz` | `data/parsed/dblp_papers.csv` |
-| 3 | `03_filter_ai_papers.py` | Filter AI papers by title keywords OR venue name | `dblp_papers.csv` | `data/parsed/dblp_ai_papers.csv` |
-| **6** | **`06_compare_dblp_openalex.py`** | **Compare DBLP vs OpenAlex coverage per year** | `dblp_papers.csv` + OpenAlex bulk data | `data/output/coverage_*.csv`, report, plot |
-| 4 | `04_crossref_openalex.py` | Cross-reference DBLP AI papers with OpenAlex for country data | `dblp_ai_papers.csv` + OpenAlex bulk data | `dblp_ai_papers_with_country.csv` |
-| 5 | `05_aggregate_counts.py` | Aggregate yearly CN vs US counts + plot | `dblp_ai_papers_with_country.csv` | `data/output/yearly_counts.csv`, plot |
+| Step | Script | Description | Output |
+|------|--------|-------------|--------|
+| 1 | `01_download_dblp.sh` | Download DBLP XML dump (~4 GB) | `data/raw/dblp.xml.gz` |
+| 2 | `02_parse_dblp.py` | Parse XML → flat CSV (articles + conference papers) | `data/parsed/dblp_papers.csv` |
+| 3 | `03_filter_ai_papers.py` | Filter AI papers by title keywords OR venue | `data/parsed/dblp_ai_papers.csv` |
+| 7 | `07_quick_estimate.py` | Task 1 percentages (fast, no OpenAlex) | `data/output/quick_estimate.txt` |
+| 6 | `06_compare_dblp_openalex.py` | Algo1 + Algo2 via OpenAlex bulk scan (~12 h) | `coverage_ai_papers.csv`, `dblp_ai_unmatched.csv` |
+| 8 | `08_openalex_search_api.py` | Algo3 via Search API on residual (resumable) | `dblp_ai_api_matches.csv` |
+| 9 | `09_final_report.py` | Per-year percentages across all three algos | `final_report.txt`, `final_report.csv` |
 
 ## Quick Start
 
 ```bash
-# Install dependencies
 pip install lxml matplotlib numpy
 
-# Configure paths for your machine
 cp config.example.py config.py
-# Edit config.py: set DATA_DIR and OPENALEX_DIR
+# Edit config.py: set DATA_DIR, OPENALEX_DIR, OPENALEX_MAILTO
 
-# 1. Download DBLP
 bash 01_download_dblp.sh
-
-# 2. Parse (takes ~20-40 min on the full XML)
 python 02_parse_dblp.py
-
-# 3. Filter AI papers
 python 03_filter_ai_papers.py
-# → Read the printed report: check keyword/venue match counts and affiliation coverage
 
-# 6. Compare against OpenAlex (takes ~30-60 min)
-python 06_compare_dblp_openalex.py
-# → Check data/output/coverage_report.txt and dblp_only_ai_sample.csv
+python 07_quick_estimate.py              # Task 1 (fast)
+python 06_compare_dblp_openalex.py       # Algo1 + Algo2 (~12h)
+python 08_openalex_search_api.py         # Algo3 (resumable)
+python 09_final_report.py                # final table
 ```
+
+On Princeton HPC, use the SLURM wrappers under `slurm/` instead.
 
 ## Configuration
 
@@ -56,60 +56,72 @@ Copy `config.example.py` to `config.py` (gitignored) and set:
 
 - **`DATA_DIR`** — where DBLP raw/parsed/output data lives
 - **`OPENALEX_DIR`** — path to the OpenAlex `works/` directory with `.gz` files
+- **`OPENALEX_MAILTO`** — your email, for OpenAlex's polite pool
+
+### OpenAlex `mailto`
+
+OpenAlex asks API clients to identify themselves with an email so they can contact you before rate-limiting. Clients that do land in the ["polite pool"](https://docs.openalex.org/how-to-use-the-api/rate-limits-and-authentication) with higher throughput. Step 08 uses this — without it, long runs are much slower.
+
+Two ways to set it (env var wins if both are present):
+
+1. **In `config.py`** — edit `OPENALEX_MAILTO = 'you@example.com'`. Best for the usual case: set it once per machine.
+2. **Env var `OPENALEX_MAILTO`** — overrides `config.py` at runtime. Useful when you share a `config.py` across users, or want to set it per-job:
+   ```bash
+   export OPENALEX_MAILTO=you@princeton.edu
+   python 08_openalex_search_api.py
+   ```
+   In a SLURM script, add `export OPENALEX_MAILTO=...` before the `python` line.
+
+If neither is set, the script warns and falls back to the slow (anonymous) pool.
 
 ### Analysis parameters (`dblp_config.py`)
 
 - **Year range**: `YEAR_MIN` / `YEAR_MAX` (default 2015–2025)
-- **AI keywords**: `AI_KEYWORDS` (substring match) and `AI_KEYWORDS_WHOLE_WORD` (exact word match for short acronyms like "AI", "LLM", "NLP")
-- **AI venues**: `AI_VENUES` — conference and journal names matched against DBLP's `<booktitle>` / `<journal>` fields
-- **Country patterns**: regex patterns for inferring CN/US from DBLP affiliation text
+- **AI keywords**: `AI_KEYWORDS` (substring) and `AI_KEYWORDS_WHOLE_WORD` (word-boundary match for short acronyms like "AI", "LLM", "NLP")
+- **AI venues**: `AI_VENUES` — conference/journal names matched against DBLP's `<booktitle>` / `<journal>` fields
+
+### Step 08 fuzzy-match thresholds
+
+Top-1 Search API hit is accepted if year is within ±1 and any tier passes:
+
+| Tier | Title Jaccard | Author overlap | Relevance |
+|------|---------------|----------------|-----------|
+| strong | ≥ 0.90 | — | — |
+| title_author | ≥ 0.60 | ≥ 1 surname | — |
+| weak | ≥ 0.50 | ≥ 1 surname | ≥ 50 |
+
+Every probe (matched or not) is logged to `dblp_ai_api_matches.csv` with all signals, so thresholds can be re-tuned after the fact without re-querying.
 
 ## AI Paper Identification
 
-A DBLP paper is classified as AI-related if **either**:
+A DBLP paper is classified AI if **either**:
+1. Title matches a keyword from `AI_KEYWORDS` (or a whole-word acronym in `AI_KEYWORDS_WHOLE_WORD`).
+2. Venue matches an entry in `AI_VENUES`.
 
-1. **Title keyword match** — title contains any keyword from the curated list (same list as the OpenAlex study, plus additional CS-specific terms like "graph neural network", "prompt tuning", etc.)
-2. **Venue match** — published in a known AI conference (NeurIPS, ICML, AAAI, ACL, CVPR, ...) or journal (JMLR, TPAMI, ...)
-
-This OR logic is intentional: venue matching captures AI papers with generic titles, while keyword matching captures AI papers in non-AI venues.
-
-## Country Attribution (DBLP Limitation)
-
-DBLP has sparse affiliation/country metadata compared to OpenAlex. The pipeline handles this in two stages:
-
-1. **Step 03** attempts country inference from DBLP `<note type="affiliation">` fields and reports coverage rate
-2. **Step 04** (optional) cross-references unmatched papers with OpenAlex by DOI/title to fill in country data
-
-Run step 03 first and check the affiliation coverage report before deciding whether step 04 is needed.
+The OR logic is intentional: venue match catches AI papers with generic titles, keyword match catches AI papers in non-AI venues.
 
 ## Output Files
 
-After running the full pipeline:
-
 ```
 data/output/
-├── coverage_all_papers.csv          # DBLP vs OA overlap, all papers, by year
-├── coverage_ai_papers.csv           # DBLP vs OA overlap, AI papers, by year
-├── coverage_report.txt              # Formatted comparison table
-├── fig_coverage_comparison.png      # Two-panel coverage plot
-├── dblp_only_ai_sample.csv          # Sample of AI papers in DBLP but not OA
-├── yearly_counts.csv                # CN vs US counts by year (after step 05)
-├── yearly_counts_by_method.csv      # Breakdown by title/venue match method
-├── summary_stats.txt                # Summary statistics
-└── fig_cn_vs_us.png                 # CN vs US trend plot
+├── quick_estimate.txt              # Task 1 percentages
+├── coverage_ai_papers.csv          # Algo1 + Algo2 per-year counts
+├── coverage_live.txt               # live progress while step 06 runs
+├── dblp_ai_unmatched.csv           # DBLP AI keys missed by Algo1+2 → input to step 08
+├── dblp_ai_api_matches.csv         # every Search API probe, with signals
+├── final_report.txt                # human-readable per-year table
+└── final_report.csv                # same data, machine-readable
 ```
 
 ## Dependencies
 
 - Python 3.10+
-- `lxml` — XML parsing
-- `matplotlib` — plotting
-- `numpy`
-- `wget` — for downloading DBLP dump (shell)
+- `lxml`, `matplotlib`, `numpy`
+- `wget` (for `01_download_dblp.sh`)
 
 ## Key References
 
 - `paper.md` — original study methodology description
-- `utils.py` — OpenAlex analysis script with AI keyword list
 - DBLP data: https://dblp.org/xml/
 - OpenAlex data: https://docs.openalex.org/download-all-data
+- OpenAlex polite pool: https://docs.openalex.org/how-to-use-the-api/rate-limits-and-authentication

@@ -18,4 +18,6 @@ OPENALEX_DIR = Path('/path/to/openalex/works')
 
 # Email for OpenAlex "polite pool" (higher rate limits on the REST API).
 # See https://docs.openalex.org/how-to-use-the-api/rate-limits-and-authentication
+# May also be overridden at runtime with the OPENALEX_MAILTO environment
+# variable (env var wins over the value set here).
 OPENALEX_MAILTO = 'you@example.com'
