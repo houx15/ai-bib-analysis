@@ -1,15 +1,18 @@
 """
 Step 9: Final per-year percentages combining three cumulative match strategies.
 
-  Algo 1: DOI exact match                       (from step 06)
-  Algo 2: + normalized-title exact match        (from step 06)
-  Algo 3: + OpenAlex Search API (fuzzy)         (from step 08)
+  Algo 1: DOI exact match                          (from step 06)
+  Algo 2: + normalized-title exact match           (from step 06)
+  Algo 3: + live OpenAlex API                      (from steps 08a + 08b)
+          - 08a: DOI lookup   → tier 'doi_api'
+          - 08b: search top-1 → tier 'strong' | 'title_author' | 'weak'
 
 Inputs:
   data/parsed/dblp_papers.csv
   data/parsed/dblp_ai_papers.csv
   data/output/coverage_ai_papers.csv
-  data/output/dblp_ai_api_matches.csv
+  data/output/dblp_ai_doi_matches.csv          (from step 08a)
+  data/output/dblp_ai_search_matches.csv       (from step 08b)
   data/output/dblp_ai_unmatched.csv
 
 Outputs:
@@ -70,18 +73,26 @@ def main():
     else:
         print(f"WARNING: {cov_path} not found")
 
-    # ── API matches from step 08 (with tier breakdown) ────────────────────
+    # ── API matches from steps 08a + 08b (with tier breakdown) ────────────
     api_by_tier: dict[str, dict[int, int]] = {
+        'doi_api': defaultdict(int),
         'strong': defaultdict(int),
         'title_author': defaultdict(int),
         'weak': defaultdict(int),
     }
-    api_any: dict[int, int] = defaultdict(int)  # any tier
-    api_path = OUTPUT_DIR / 'dblp_ai_api_matches.csv'
-    if api_path.exists():
-        with open(api_path, 'r', encoding='utf-8') as f:
+    api_any: dict[int, int] = defaultdict(int)
+    seen_keys: set[str] = set()  # de-dup across the two stage files
+
+    def ingest_matches(path, label: str):
+        if not path.exists():
+            print(f"NOTE: {path} not found — {label} not yet run")
+            return
+        with open(path, 'r', encoding='utf-8') as f:
             for row in csv.DictReader(f):
                 if row.get('matched', '0') != '1':
+                    continue
+                key = row.get('dblp_key', '')
+                if key in seen_keys:
                     continue
                 try:
                     y = int(row['year'])
@@ -93,8 +104,11 @@ def main():
                 if tier in api_by_tier:
                     api_by_tier[tier][y] += 1
                 api_any[y] += 1
-    else:
-        print(f"NOTE: {api_path} not found — step 08 not yet run")
+                seen_keys.add(key)
+
+    # 08a matches take precedence (DOI is more authoritative than search).
+    ingest_matches(OUTPUT_DIR / 'dblp_ai_doi_matches.csv', 'step 08a')
+    ingest_matches(OUTPUT_DIR / 'dblp_ai_search_matches.csv', 'step 08b')
 
     # ── Assemble rows ─────────────────────────────────────────────────────
     def pct(n, d): return f"{100*n/max(d,1):.1f}"
@@ -125,6 +139,7 @@ def main():
             'algo2_pct': pct(a2, ai),
             'algo3_doi_title_api': a3,
             'algo3_pct': pct(a3, ai),
+            'api_doi': api_by_tier['doi_api'][y],
             'api_strong': api_by_tier['strong'][y],
             'api_title_author': api_by_tier['title_author'][y],
             'api_weak': api_by_tier['weak'][y],
@@ -171,20 +186,24 @@ def main():
         )
 
     lines.append("\n[3] API match confidence breakdown (Algo3 only)")
-    lines.append(f"{'Year':>6} {'strong':>9} {'title+auth':>12} {'weak':>9} {'total':>9}")
-    lines.append("-" * 50)
+    lines.append(f"{'Year':>6} {'doi_api':>9} {'strong':>9} "
+                 f"{'title+auth':>12} {'weak':>9} {'total':>9}")
+    lines.append("-" * 60)
     for r in rows:
-        tot = r['api_strong'] + r['api_title_author'] + r['api_weak']
-        lines.append(f"{r['year']:>6} {r['api_strong']:>9,} "
-                     f"{r['api_title_author']:>12,} {r['api_weak']:>9,} {tot:>9,}")
+        tot = (r['api_doi'] + r['api_strong']
+               + r['api_title_author'] + r['api_weak'])
+        lines.append(f"{r['year']:>6} {r['api_doi']:>9,} "
+                     f"{r['api_strong']:>9,} {r['api_title_author']:>12,} "
+                     f"{r['api_weak']:>9,} {tot:>9,}")
 
     lines.append("")
     lines.append("Notes:")
     lines.append("  Algo1 ⊆ Algo2 ⊆ Algo3 (nested, each strategy only runs on residuals)")
-    lines.append("  strong       = Jaccard ≥ 0.90")
-    lines.append("  title+author = Jaccard ≥ 0.60 AND ≥1 author surname overlap")
-    lines.append("  weak         = Jaccard ≥ 0.50 AND author overlap AND relevance ≥ 50")
-    lines.append("  (all API matches also require |dblp_year − oa_year| ≤ 1)")
+    lines.append("  doi_api      = DBLP DOI found via live OpenAlex DOI lookup (exact)")
+    lines.append("  strong       = search top-1, Jaccard ≥ 0.90")
+    lines.append("  title+author = search top-1, Jaccard ≥ 0.60 AND ≥1 author surname overlap")
+    lines.append("  weak         = search top-1, Jaccard ≥ 0.50 AND author overlap AND relevance ≥ 50")
+    lines.append("  (search matches also require |dblp_year − oa_year| ≤ 1; doi_api has no year filter)")
 
     report = '\n'.join(lines)
     print(report)

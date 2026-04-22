@@ -16,8 +16,14 @@ DATA_DIR = Path('/path/to/dblp-analysis/data')
 # OpenAlex bulk data (works/ directory containing .gz files)
 OPENALEX_DIR = Path('/path/to/openalex/works')
 
-# Email for OpenAlex "polite pool" (higher rate limits on the REST API).
-# See https://docs.openalex.org/how-to-use-the-api/rate-limits-and-authentication
-# May also be overridden at runtime with the OPENALEX_MAILTO environment
-# variable (env var wins over the value set here).
+# OpenAlex Search API authentication (used by step 08).
+#
+# Option A — API key (recommended): create a free account at openalex.org,
+# copy your key from Settings, and set it here or via the OPENALEX_API_KEY
+# env var. Free tier: 1,000 search calls / day (~1,000 papers/day).
+# When OPENALEX_API_KEY is set, OPENALEX_MAILTO is ignored.
+OPENALEX_API_KEY = ''
+
+# Option B — mailto / polite pool (legacy): no daily call limit but lower
+# throughput. May also be set via the OPENALEX_MAILTO env var.
 OPENALEX_MAILTO = 'you@example.com'

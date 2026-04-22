@@ -16,9 +16,14 @@ except ImportError:
     from config import DATA_DIR, OPENALEX_DIR
     OPENALEX_MAILTO = 'you@example.com'
 
-# Env var overrides config.py, so you can keep a shared config.py and still
-# set your own email on the command line (e.g. in a SLURM job).
 OPENALEX_MAILTO = os.environ.get('OPENALEX_MAILTO', OPENALEX_MAILTO)
+
+try:
+    from config import OPENALEX_API_KEY  # type: ignore[assignment]
+except ImportError:
+    OPENALEX_API_KEY = ''
+
+OPENALEX_API_KEY = os.environ.get('OPENALEX_API_KEY', OPENALEX_API_KEY)
 
 # ── Derived paths ────────────────────────────────────────────────────────────
 RAW_DIR        = DATA_DIR / 'raw'          # downloaded dblp files

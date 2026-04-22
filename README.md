@@ -25,7 +25,8 @@ Algo1 ⊆ Algo2 ⊆ Algo3 — each strategy only runs on what the previous one m
 | 3 | `03_filter_ai_papers.py` | Filter AI papers by title keywords OR venue | `data/parsed/dblp_ai_papers.csv` |
 | 7 | `07_quick_estimate.py` | Task 1 percentages (fast, no OpenAlex) | `data/output/quick_estimate.txt` |
 | 6 | `06_compare_dblp_openalex.py` | Algo1 + Algo2 via OpenAlex bulk scan (~12 h) | `coverage_ai_papers.csv`, `dblp_ai_unmatched.csv` |
-| 8 | `08_openalex_search_api.py` | Algo3 via Search API on residual (resumable) | `dblp_ai_api_matches.csv` |
+| 8a | `08a_openalex_doi.py` | Algo3 stage 1 — DOI lookup (cheap, filter pool) | `dblp_ai_doi_matches.csv` |
+| 8b | `08b_openalex_search.py` | Algo3 stage 2 — Search API on DOI residual (**paid**) | `dblp_ai_search_matches.csv` |
 | 9 | `09_final_report.py` | Per-year percentages across all three algos | `final_report.txt`, `final_report.csv` |
 
 ## Quick Start
@@ -34,7 +35,7 @@ Algo1 ⊆ Algo2 ⊆ Algo3 — each strategy only runs on what the previous one m
 pip install lxml matplotlib numpy
 
 cp config.example.py config.py
-# Edit config.py: set DATA_DIR, OPENALEX_DIR, OPENALEX_MAILTO
+# Edit config.py: set DATA_DIR, OPENALEX_DIR, OPENALEX_API_KEY
 
 bash 01_download_dblp.sh
 python 02_parse_dblp.py
@@ -42,7 +43,12 @@ python 03_filter_ai_papers.py
 
 python 07_quick_estimate.py              # Task 1 (fast)
 python 06_compare_dblp_openalex.py       # Algo1 + Algo2 (~12h)
-python 08_openalex_search_api.py         # Algo3 (resumable)
+
+# Algo3 is split into two explicit stages — run 08a first, check the
+# printed search residual, then run 08b after setting up billing if needed.
+python 08a_openalex_doi.py               # cheap DOI lookup stage
+python 08b_openalex_search.py            # paid search stage (post-billing)
+
 python 09_final_report.py                # final table
 ```
 
@@ -56,23 +62,31 @@ Copy `config.example.py` to `config.py` (gitignored) and set:
 
 - **`DATA_DIR`** — where DBLP raw/parsed/output data lives
 - **`OPENALEX_DIR`** — path to the OpenAlex `works/` directory with `.gz` files
-- **`OPENALEX_MAILTO`** — your email, for OpenAlex's polite pool
+- **`OPENALEX_API_KEY`** — API key for OpenAlex Search API (step 08); see section below
+- **`OPENALEX_MAILTO`** — fallback email for the legacy polite pool (only used if no API key)
 
-### OpenAlex `mailto`
+### OpenAlex Search API authentication (step 08)
 
-OpenAlex asks API clients to identify themselves with an email so they can contact you before rate-limiting. Clients that do land in the ["polite pool"](https://docs.openalex.org/how-to-use-the-api/rate-limits-and-authentication) with higher throughput. Step 08 uses this — without it, long runs are much slower.
+OpenAlex now requires authentication for the Search API. Two options — **API key takes priority** if both are set.
 
-Two ways to set it (env var wins if both are present):
+**Option A — API key (recommended)**
 
-1. **In `config.py`** — edit `OPENALEX_MAILTO = 'you@example.com'`. Best for the usual case: set it once per machine.
-2. **Env var `OPENALEX_MAILTO`** — overrides `config.py` at runtime. Useful when you share a `config.py` across users, or want to set it per-job:
-   ```bash
-   export OPENALEX_MAILTO=you@princeton.edu
-   python 08_openalex_search_api.py
+1. Create a free account at [openalex.org](https://openalex.org) and copy your key from Settings.
+2. Set it in `config.py`:
+   ```python
+   OPENALEX_API_KEY = 'your-key-here'
    ```
-   In a SLURM script, add `export OPENALEX_MAILTO=...` before the `python` line.
+   Or via env var (overrides config):
+   ```bash
+   export OPENALEX_API_KEY=your-key-here
+   ```
+3. Free tier: **1,000 search calls/day** (~1,000 papers/day). The script is resumable, so large jobs just run over multiple days. Paid plans give higher daily limits.
 
-If neither is set, the script warns and falls back to the slow (anonymous) pool.
+**Option B — mailto / polite pool (legacy)**
+
+Set `OPENALEX_MAILTO = 'you@example.com'` in `config.py` or the `OPENALEX_MAILTO` env var. No hard daily call limit, but lower throughput. Only used if `OPENALEX_API_KEY` is not set.
+
+If neither is configured, the script warns and runs as anonymous — expect 429 errors immediately.
 
 ### Analysis parameters (`dblp_config.py`)
 
@@ -80,17 +94,41 @@ If neither is set, the script warns and falls back to the slow (anonymous) pool.
 - **AI keywords**: `AI_KEYWORDS` (substring) and `AI_KEYWORDS_WHOLE_WORD` (word-boundary match for short acronyms like "AI", "LLM", "NLP")
 - **AI venues**: `AI_VENUES` — conference/journal names matched against DBLP's `<booktitle>` / `<journal>` fields
 
-### Step 08 fuzzy-match thresholds
+### Step 08 — two explicit stages
 
-Top-1 Search API hit is accepted if year is within ±1 and any tier passes:
+Split into two scripts so you can see the paid search workload before committing to it.
 
-| Tier | Title Jaccard | Author overlap | Relevance |
-|------|---------------|----------------|-----------|
-| strong | ≥ 0.90 | — | — |
-| title_author | ≥ 0.60 | ≥ 1 surname | — |
-| weak | ≥ 0.50 | ≥ 1 surname | ≥ 50 |
+**Stage 08a — DOI lookup** (`works/doi:<doi>`): filter pool on OpenAlex, ~10k/day free. Runs only on papers that have a DOI. A hit is accepted unconditionally — DOIs are globally unique — and recorded with `tier='doi_api'`. This is the stage that rescues 2025 DBLP papers that were published after your OpenAlex snapshot date.
 
-Every probe (matched or not) is logged to `dblp_ai_api_matches.csv` with all signals, so thresholds can be re-tuned after the fact without re-querying.
+```bash
+python 08a_openalex_doi.py
+```
+
+At the end, 08a prints a summary like:
+```
+DOI stage totals (cumulative across all runs):
+  matched by DOI:        12,345
+  DOI lookup failed:     234    (404 + errors)
+  papers with no DOI:    5,678
+  → need search API (step 08b): 5,912
+```
+
+Use that last number to decide whether to set up billing before running 08b.
+
+**Stage 08b — Search API** (`works?search=<title>&filter=publication_year:<y>`): **paid** — each call counts against the OpenAlex search quota ($1/1,000 calls; 1,000/day free). Runs on the residual from 08a (papers with no DOI + papers whose DOI returned 404/errored). Top-1 hit is accepted if year is within ±1 and any tier passes:
+
+```bash
+python 08b_openalex_search.py
+```
+
+| Tier | Title Jaccard | Author overlap | Relevance | Source |
+|------|---------------|----------------|-----------|--------|
+| doi_api | (exact via DOI) | — | — | 08a |
+| strong | ≥ 0.90 | — | — | 08b |
+| title_author | ≥ 0.60 | ≥ 1 surname | — | 08b |
+| weak | ≥ 0.50 | ≥ 1 surname | ≥ 50 | 08b |
+
+Every probe (matched or not) is logged so thresholds can be re-tuned without re-querying: 08a writes `dblp_ai_doi_matches.csv`, 08b writes `dblp_ai_search_matches.csv`. Both files are resumable — just re-run the script and it skips already-processed `dblp_key`s.
 
 ## AI Paper Identification
 
@@ -108,7 +146,8 @@ data/output/
 ├── coverage_ai_papers.csv          # Algo1 + Algo2 per-year counts
 ├── coverage_live.txt               # live progress while step 06 runs
 ├── dblp_ai_unmatched.csv           # DBLP AI keys missed by Algo1+2 → input to step 08
-├── dblp_ai_api_matches.csv         # every Search API probe, with signals
+├── dblp_ai_doi_matches.csv         # one row per DOI lookup (step 08a)
+├── dblp_ai_search_matches.csv      # one row per search probe (step 08b)
 ├── final_report.txt                # human-readable per-year table
 └── final_report.csv                # same data, machine-readable
 ```
@@ -124,4 +163,4 @@ data/output/
 - `paper.md` — original study methodology description
 - DBLP data: https://dblp.org/xml/
 - OpenAlex data: https://docs.openalex.org/download-all-data
-- OpenAlex polite pool: https://docs.openalex.org/how-to-use-the-api/rate-limits-and-authentication
+- OpenAlex API auth & rate limits: https://developers.openalex.org/api-reference/authentication
