@@ -3,7 +3,7 @@
 #SBATCH --ntasks=1
 #SBATCH --mem=32G
 #SBATCH --cpus-per-task=1
-#SBATCH --time=06:00:00
+#SBATCH --time=12:00:00
 #SBATCH --mail-type=end
 #SBATCH --mail-user=yh6580@princeton.edu
 
