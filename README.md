@@ -9,12 +9,24 @@ Measures what fraction of DBLP AI papers can be recovered from OpenAlex, per yea
 - Of AI papers, what % are conference papers?
 - Of AI papers, what % lack a DOI?
 
-**Task 2 — Cumulative coverage of DBLP AI papers in OpenAlex**:
-1. DOI exact match
-2. + normalized-title exact match on the DOI residual
-3. + OpenAlex Search API (fuzzy top-1) on the DOI|Title residual
+**Task 2 — Cumulative strong-only coverage of DBLP AI papers in OpenAlex**:
+1. DOI exact match (bulk + live API DOI lookup)
+2. + normalized-title exact match (bulk)
+3. + OpenAlex Search API (Jaccard ≥ 0.90, "strong" tier only)
 
-Algo1 ⊆ Algo2 ⊆ Algo3 — each strategy only runs on what the previous one missed.
+Buckets are nested: `doi_only` ⊆ `doi_title` ⊆ `doi_title_search`. The
+weaker search tiers (`title_author`, `weak`) are kept in the raw stage
+CSVs for inspection but **excluded** from the final report — only
+strong-confidence matches count as "really matched".
+
+**Task 3 — US vs. China AI publication trends** (line plots, PDF):
+
+Country attribution mirrors `reference/openalex_method.md`: corresponding
+author's `countries[0]` → first author's `countries[0]`; restricted to
+{CN, HK, TW, US}. Raw codes are preserved end-to-end; the {CN,HK,TW} →
+"China" grouping happens only at plot time (toggleable via `--cn-only`).
+Two AI-identification methods are reported: (a) title keyword only,
+(b) title keyword OR known AI venue.
 
 ## Pipeline
 
@@ -27,7 +39,10 @@ Algo1 ⊆ Algo2 ⊆ Algo3 — each strategy only runs on what the previous one m
 | 6 | `06_compare_dblp_openalex.py` | Algo1 + Algo2 via OpenAlex bulk scan (~12 h) | `coverage_ai_papers.csv`, `dblp_ai_unmatched.csv` |
 | 8a | `08a_openalex_doi.py` | Algo3 stage 1 — DOI lookup (cheap, filter pool) | `dblp_ai_doi_matches.csv` |
 | 8b | `08b_openalex_search.py` | Algo3 stage 2 — Search API on DOI residual (**paid**) | `dblp_ai_search_matches.csv` |
-| 9 | `09_final_report.py` | Per-year percentages across all three algos | `final_report.txt`, `final_report.csv` |
+| 9 | `09_final_report.py` | Per-year strong-only coverage (doi / +title / +search) | `final_report.txt`, `final_report.csv` |
+| 10a | `10a_country_bulk.py` | Bulk OpenAlex .gz scan → country per matched DBLP key (no network) | `dblp_ai_country.csv` |
+| 10b | `10b_country_api.py` | API top-up for 08a doi_api + 08b strong matches not in bulk | `dblp_ai_country.csv` (upsert) |
+| 11 | `11_country_plots.py` | US vs. China yearly trend (two PDFs, line plot) | `fig_country_title.pdf`, `fig_country_title_venue.pdf`, `country_counts.csv` |
 
 ## Quick Start
 
@@ -49,7 +64,13 @@ python 06_compare_dblp_openalex.py       # Algo1 + Algo2 (~12h)
 python 08a_openalex_doi.py               # cheap DOI lookup stage
 python 08b_openalex_search.py            # paid search stage (post-billing)
 
-python 09_final_report.py                # final table
+python 09_final_report.py                # final table (strong-only)
+
+# Step 10 is split like step 08: 10a needs no network (HPC compute node);
+# 10b needs outbound network (login node / submit host).
+python 10a_country_bulk.py               # bulk gz scan, ~12h, no network
+python 10b_country_api.py                # API top-up for 08a/08b strong, free tier
+python 11_country_plots.py               # US vs. China line plots (PDF)
 ```
 
 On Princeton HPC, use the SLURM wrappers under `slurm/` instead.
@@ -130,6 +151,32 @@ python 08b_openalex_search.py
 
 Every probe (matched or not) is logged so thresholds can be re-tuned without re-querying: 08a writes `dblp_ai_doi_matches.csv`, 08b writes `dblp_ai_search_matches.csv`. Both files are resumable — just re-run the script and it skips already-processed `dblp_key`s.
 
+### Step 10 — country attribution, two stages
+
+Mirrors the 08a/08b split because country lookup also has two halves
+with different requirements (one I/O-heavy, no network; one network,
+small).
+
+**Stage 10a — bulk** (`10a_country_bulk.py`): re-walks the OpenAlex
+`.gz` files using the same DOI/normalized-title indices as step 06, but
+this time records `authorships` and infers country. **No network**, so
+this runs cleanly on Princeton compute nodes. Heavy (~12 h). Resumable —
+flushes `dblp_ai_country.csv` every ~30 minutes during the scan.
+
+**Stage 10b — API top-up** (`10b_country_api.py`): for 08a `doi_api` and
+08b `strong` matches that the bulk snapshot didn't contain (especially
+2025 papers), fetches `/works/<openalex_id>` from the live API. This
+endpoint is in the **free filter pool** (~10k/day, no search quota
+charge). Run it on a host with outbound network — the same one you used
+for 08a/08b.
+
+Country logic mirrors `reference/openalex_method.md`: corresponding
+author's `countries[0]` → first author's `countries[0]`; restricted to
+{CN, HK, TW, US}. **Codes are stored raw** in `dblp_ai_country.csv`
+(no HK/TW collapse at attribution time) so re-aggregation later is a
+plotting question, not a re-run. Step 11 groups {CN,HK,TW} as "China"
+by default; pass `--cn-only` to exclude HK and TW.
+
 ## AI Paper Identification
 
 A DBLP paper is classified AI if **either**:
@@ -148,8 +195,12 @@ data/output/
 ├── dblp_ai_unmatched.csv           # DBLP AI keys missed by Algo1+2 → input to step 08
 ├── dblp_ai_doi_matches.csv         # one row per DOI lookup (step 08a)
 ├── dblp_ai_search_matches.csv      # one row per search probe (step 08b)
-├── final_report.txt                # human-readable per-year table
-└── final_report.csv                # same data, machine-readable
+├── final_report.txt                # strong-only per-year coverage (text)
+├── final_report.csv                # same, machine-readable
+├── dblp_ai_country.csv             # per-DBLP-key country (step 10)
+├── country_counts.csv              # raw US/CN counts behind the plots
+├── fig_country_title.pdf           # US vs CN, AI = title keyword
+└── fig_country_title_venue.pdf     # US vs CN, AI = title keyword OR AI venue
 ```
 
 ## Dependencies

@@ -144,6 +144,21 @@ def query_doi(doi: str, timeout: float = 20.0, retries: int = 4) -> dict | None:
     return _request(url, timeout, retries)
 
 
+def query_by_id(openalex_id: str,
+                timeout: float = 20.0, retries: int = 4) -> dict | None:
+    """GET /works/<short_id> — filter pool. Accepts a full URL
+    (https://openalex.org/W…) or a bare short id (W…)."""
+    if not openalex_id:
+        return None
+    short = openalex_id.rsplit('/', 1)[-1].strip()
+    if not short:
+        return None
+    params = auth_params()
+    params['select'] = 'id,doi,publication_year,authorships'
+    url = f'{API_BASE}/{short}?{urllib.parse.urlencode(params)}'
+    return _request(url, timeout, retries)
+
+
 def query_top1(title: str, year: int,
                timeout: float = 20.0, retries: int = 6) -> dict | None:
     """GET /works?search=<title>&filter=publication_year:<y-1>-<y+1>&per-page=1.
